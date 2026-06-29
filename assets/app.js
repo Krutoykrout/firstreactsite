@@ -848,12 +848,23 @@
     );
   }
 
+  function LoadingScreen() {
+    return h('main', { className: 'site-loader' },
+      h('div', { className: 'site-loader-card' },
+        h('div', { className: 'brand-mark loader-mark' }, 'AC'),
+        h('h1', null, 'Загружаем сайт'),
+        h('p', null, 'Подтягиваем актуальные данные каталога и контактов.'),
+        h('div', { className: 'loader-line' }, h('span', null))
+      )
+    );
+  }
+
   function NotFound() { return h('main', null, h(PageHero, { eyebrow: '404', title: 'Страница не найдена', text: 'Такой страницы нет.' })); }
 
   function App() {
     React.Component.call(this);
     var cfgReady = getSupabaseConfig().ready;
-    this.state = { route: getRoute(), data: cfgReady ? clone(defaultData) : loadData(), authed: safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
+    this.state = { route: getRoute(), data: cfgReady ? null : loadData(), authed: safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '', bootLoading: cfgReady, bootError: '' };
     this.onHash = this.onHash.bind(this);
     this.setData = this.setData.bind(this);
     this.setAdminState = this.setAdminState.bind(this);
@@ -873,13 +884,23 @@
   App.prototype.setAdminState = function (patch) { this.setState({ adminState: Object.assign({}, this.state.adminState, patch) }); };
   App.prototype.loadRemoteNow = function () {
     var self = this;
-    if (!getSupabaseConfig().ready) return Promise.resolve(false);
+    if (!getSupabaseConfig().ready) { self.setState({ bootLoading: false }); return Promise.resolve(false); }
     self.setState({ remoteStatus: 'Загружаю данные из базы...' });
     return loadRemoteData().then(function (remoteData) {
-      if (remoteData) { saveData(remoteData); self.setState({ data: remoteData, remoteStatus: 'Данные загружены из базы.' }); }
-      else self.setState({ remoteStatus: 'В базе пока нет данных сайта.' });
+      if (remoteData) {
+        saveData(remoteData);
+        self.setState({ data: remoteData, bootLoading: false, bootError: '', remoteStatus: 'Данные загружены из базы.' });
+      } else {
+        var fallback = loadData();
+        self.setState({ data: fallback, bootLoading: false, bootError: '', remoteStatus: 'В базе пока нет данных сайта.' });
+      }
       return true;
-    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось загрузить данные сайта: ' + (err && err.message ? err.message.slice(0, 120) : 'ошибка') }); return false; });
+    }).catch(function (err) {
+      var message = err && err.message ? err.message.slice(0, 180) : 'ошибка';
+      var fallback = loadData();
+      self.setState({ data: fallback, bootLoading: false, bootError: message, remoteStatus: 'Нет соединения с базой. Показана последняя сохранённая версия.' });
+      return false;
+    });
   };
   App.prototype.saveRemoteNow = function (data) {
     var self = this;
@@ -894,7 +915,8 @@
   };
   App.prototype.render = function () {
     var route = this.state.route;
-    var data = this.state.data;
+    if (this.state.bootLoading) return h(LoadingScreen);
+    var data = this.state.data || clone(defaultData);
     var isAdmin = route === '/admin';
     var page;
     if (route === '/') page = h(Home, { data: data });
