@@ -81,6 +81,28 @@
 
   function saveData(data) { safeSet(STORAGE_KEY, JSON.stringify(data)); }
 
+  function imageFileToDataUrl(file, done) {
+    var reader = new FileReader();
+    reader.onload = function () {
+      var raw = reader.result;
+      try {
+        var img = new Image();
+        img.onload = function () {
+          var maxSide = 1200;
+          var scale = Math.min(1, maxSide / Math.max(img.width || 1, img.height || 1));
+          var canvas = document.createElement('canvas');
+          canvas.width = Math.max(1, Math.round((img.width || 1) * scale));
+          canvas.height = Math.max(1, Math.round((img.height || 1) * scale));
+          var ctx = canvas.getContext('2d');
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          done(canvas.toDataURL('image/jpeg', 0.78));
+        };
+        img.onerror = function () { done(raw); };
+        img.src = raw;
+      } catch (e) { done(raw); }
+    };
+    reader.readAsDataURL(file);
+  }
 
   function tryParseJson(raw) {
     if (!raw) return null;
@@ -89,11 +111,12 @@
 
   function getSupabaseConfig() {
     var fileConfig = window.SITE_SUPABASE || {};
+    if (fileConfig.proxy) return { ready: true, proxy: true, url: '', key: '' };
     var localConfig = tryParseJson(safeGet(SUPABASE_CONFIG_KEY)) || {};
     var url = String(localConfig.url || fileConfig.url || '').trim().replace(/\/$/, '');
     var key = String(localConfig.key || fileConfig.key || '').trim();
     var looksBlank = !url || !key || url.indexOf('PROJECT_URL') >= 0 || key.indexOf('PUBLIC') >= 0 || key.indexOf('ANON') >= 0;
-    return { url: url, key: key, ready: !looksBlank };
+    return { url: url, key: key, ready: !looksBlank, proxy: false };
   }
 
   function saveSupabaseConfig(cfg) {
@@ -139,32 +162,43 @@
 
   function loadRemoteData() {
     if (!getSupabaseConfig().ready) return Promise.resolve(null);
-    return supabaseRequest('GET', '/rest/v1/settings?site_key=eq.main&select=content', null, false)
-      .then(function (rows) {
-        if (rows && rows[0] && rows[0].content) return mergeRemoteData(rows[0].content);
+    return fetch('/api/site?ts=' + Date.now(), { cache: 'no-store', credentials: 'same-origin' })
+      .then(function (res) {
+        if (!res.ok) return res.text().then(function (text) { throw new Error(text || ('API error ' + res.status)); });
+        return res.json();
+      })
+      .then(function (payload) {
+        if (payload && payload.content) return mergeRemoteData(payload.content);
         return null;
       });
   }
 
   function saveRemoteData(data) {
-    if (!getSupabaseConfig().ready || !(getSession() && getSession().access_token)) return Promise.resolve(false);
-    return supabaseRequest('POST', '/rest/v1/settings?on_conflict=site_key', { site_key: 'main', content: data }, true, { Prefer: 'resolution=merge-duplicates,return=minimal' })
-      .then(function () { return true; });
-  }
-
-  function signInSupabase(email, password) {
-    var cfg = getSupabaseConfig();
-    if (!cfg.ready) return Promise.reject(new Error('Supabase не подключён'));
-    return fetch(cfg.url + '/auth/v1/token?grant_type=password', {
+    if (!getSupabaseConfig().ready) return Promise.resolve(false);
+    return fetch('/api/save', {
       method: 'POST',
       cache: 'no-store',
-      headers: { apikey: cfg.key, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ email: email, password: password })
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ content: data })
+    }).then(function (res) {
+      if (!res.ok) return res.text().then(function (text) { throw new Error(text || ('API error ' + res.status)); });
+      return res.json().catch(function () { return { ok: true }; });
+    }).then(function () { return true; });
+  }
+
+  function signInSupabase(login, password) {
+    return fetch('/api/login', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ login: login, password: password })
     }).then(function (res) {
       if (!res.ok) return res.text().then(function (text) { throw new Error(text || 'Ошибка входа'); });
       return res.json();
     }).then(function (session) {
-      saveSession(session);
+      saveSession({ proxy: true, logged: true });
       safeSet(AUTH_KEY, 'yes');
       return session;
     });
@@ -172,25 +206,20 @@
 
   function submitRequestToSupabase(payload) {
     if (!getSupabaseConfig().ready) return Promise.resolve(false);
-    return supabaseRequest('POST', '/rest/v1/requests', payload, false, { Prefer: 'return=minimal' }).then(function () { return true; });
+    return fetch('/api/request', {
+      method: 'POST',
+      cache: 'no-store',
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload || {})
+    }).then(function (res) {
+      if (!res.ok) return res.text().then(function (text) { throw new Error(text || ('API error ' + res.status)); });
+      return true;
+    });
   }
 
   function uploadMediaToSupabase(file) {
-    var cfg = getSupabaseConfig();
-    var session = getSession();
-    if (!cfg.ready || !session || !session.access_token) return Promise.resolve(null);
-    var safeName = String(file.name || 'image').replace(/[^a-zA-Z0-9._-]/g, '-');
-    var path = 'items/' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '-' + safeName;
-    var encoded = path.split('/').map(encodeURIComponent).join('/');
-    return fetch(cfg.url + '/storage/v1/object/media/' + encoded, {
-      method: 'POST',
-      cache: 'no-store',
-      headers: { apikey: cfg.key, Authorization: 'Bearer ' + session.access_token, 'Content-Type': file.type || 'application/octet-stream' },
-      body: file
-    }).then(function (res) {
-      if (!res.ok) return res.text().then(function (text) { throw new Error(text || 'Не удалось загрузить фото'); });
-      return cfg.url + '/storage/v1/object/public/media/' + encoded;
-    });
+    return Promise.resolve(null);
   }
 
   function Header(props) {
@@ -517,7 +546,7 @@
           var password = e.currentTarget.elements.password.value;
           if (isRemote) {
             var authLogin = login.indexOf('@') >= 0 ? login : ((login === '1' || login.toLowerCase() === 'admin') ? 'admin@example.com' : login);
-            signInSupabase(authLogin, password).then(function () { props.onLogin(); }).catch(function (err) { alert('Не вошли в Supabase. Проверь email/пароль и что пользователь создан. Ошибка: ' + (err && err.message ? err.message.slice(0, 120) : '')); });
+            signInSupabase(authLogin, password).then(function () { props.onLogin(); }).catch(function (err) { alert('Не удалось войти. Проверь логин и пароль. Ошибка: ' + (err && err.message ? err.message.slice(0, 120) : '')); });
             return;
           }
           if (login === ADMIN_LOGIN && password === ADMIN_PASSWORD) {
@@ -542,7 +571,7 @@
     var state = props.state || {};
     var active = state.active || 'main';
 
-    function update(next) { setData(next); saveData(next); if (props.onRemoteSave) props.onRemoteSave(next); }
+    function update(next) { setData(next); saveData(next); }
     function patch(key, value) { var next = clone(data); next[key] = value; update(next); }
     function addCar() {
       var next = clone(data);
@@ -631,7 +660,7 @@
         h('div', { className: 'admin-savebar' },
           h('div', null,
             h('strong', null, 'Управление сайтом'),
-            h('span', null, props.remoteStatus || (getSupabaseConfig().ready ? 'Изменения сохраняются в базу после входа.' : 'Сайт работает локально.'))
+            h('span', null, props.remoteStatus || (getSupabaseConfig().ready ? 'Изменения сохраняются после кнопки «Сохранить на сайте».' : 'Сайт работает локально.'))
           ),
           h('button', { className: 'btn primary', onClick: function () { props.onRemoteSave && props.onRemoteSave(data); } }, 'Сохранить на сайте')
         ),
@@ -684,9 +713,7 @@
   function ImageField(props) {
     var car = props.car;
     function localFile(file) {
-      var reader = new FileReader();
-      reader.onload = function () { props.onChange(reader.result); };
-      reader.readAsDataURL(file);
+      imageFileToDataUrl(file, function (dataUrl) { props.onChange(dataUrl); });
     }
     function onFile(e) {
       var file = e.target.files && e.target.files[0];
@@ -826,8 +853,7 @@
   function App() {
     React.Component.call(this);
     var cfgReady = getSupabaseConfig().ready;
-    var hasRemoteSession = !!(getSession() && getSession().access_token);
-    this.state = { route: getRoute(), data: cfgReady ? clone(defaultData) : loadData(), authed: cfgReady ? hasRemoteSession : safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
+    this.state = { route: getRoute(), data: cfgReady ? clone(defaultData) : loadData(), authed: safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
     this.onHash = this.onHash.bind(this);
     this.setData = this.setData.bind(this);
     this.setAdminState = this.setAdminState.bind(this);
@@ -838,7 +864,6 @@
   App.prototype.constructor = App;
   App.prototype.componentDidMount = function () {
     window.addEventListener('hashchange', this.onHash);
-    if (getSupabaseConfig().ready && !(getSession() && getSession().access_token)) safeRemove(AUTH_KEY);
     if (!window.location.hash) window.location.hash = '/';
     this.loadRemoteNow();
   };
@@ -854,19 +879,18 @@
       if (remoteData) { saveData(remoteData); self.setState({ data: remoteData, remoteStatus: 'Данные загружены из базы.' }); }
       else self.setState({ remoteStatus: 'В базе пока нет данных сайта.' });
       return true;
-    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось загрузить данные из базы: ' + (err && err.message ? err.message.slice(0, 120) : 'ошибка') }); return false; });
+    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось загрузить данные сайта: ' + (err && err.message ? err.message.slice(0, 120) : 'ошибка') }); return false; });
   };
   App.prototype.saveRemoteNow = function (data) {
     var self = this;
     if (!getSupabaseConfig().ready) { self.setState({ remoteStatus: 'Supabase не подключён.' }); return Promise.resolve(false); }
-    if (!(getSession() && getSession().access_token)) { self.setState({ remoteStatus: 'Сначала войдите через админку Supabase.' }); return Promise.resolve(false); }
     self.setState({ remoteStatus: 'Сохраняю в базу...' });
     return saveRemoteData(data || self.state.data).then(function () {
       var saved = data || self.state.data;
       saveData(saved);
-      self.setState({ data: saved, remoteStatus: 'Сохранено в Supabase. Обновите страницу на другом устройстве.' });
+      self.setState({ data: saved, remoteStatus: 'Сохранено на сайте. Обновите страницу на другом устройстве.' });
       return true;
-    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось сохранить в Supabase: ' + (err && err.message ? err.message.slice(0, 160) : 'ошибка') }); return false; });
+    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось сохранить на сайте: ' + (err && err.message ? err.message.slice(0, 160) : 'ошибка') }); return false; });
   };
   App.prototype.render = function () {
     var route = this.state.route;
@@ -882,7 +906,7 @@
     else if (route === '/contacts') page = h(Contacts, { data: data });
     else if (route === '/request') page = h(RequestPage, { data: data, onSubmitRequest: submitRequestToSupabase });
     else if (route === '/admin') {
-      page = this.state.authed ? h(AdminPanel, { data: data, state: this.state.adminState, setAdminState: this.setAdminState, setData: this.setData, remoteStatus: this.state.remoteStatus, onRemoteLoad: this.loadRemoteNow, onRemoteSave: this.saveRemoteNow, onLogout: function () { clearSession(); this.setState({ authed: false }); }.bind(this) }) : h(AdminLogin, { onLogin: function () { this.setState({ authed: true }); this.loadRemoteNow(); }.bind(this) });
+      page = this.state.authed ? h(AdminPanel, { data: data, state: this.state.adminState, setAdminState: this.setAdminState, setData: this.setData, remoteStatus: this.state.remoteStatus, onRemoteLoad: this.loadRemoteNow, onRemoteSave: this.saveRemoteNow, onLogout: function () { fetch('/api/logout', { method: 'POST', credentials: 'same-origin' }).catch(function () {}); clearSession(); this.setState({ authed: false }); }.bind(this) }) : h(AdminLogin, { onLogin: function () { this.setState({ authed: true }); this.loadRemoteNow(); }.bind(this) });
     } else page = h(NotFound);
     return h('div', null, !isAdmin && h(Header, { data: data, route: route }), page, !isAdmin && h(Footer, { data: data }));
   };
