@@ -6,6 +6,8 @@
   var AUTH_KEY = 'avto-capital-admin-auth-v5';
   var ADMIN_LOGIN = '1';
   var ADMIN_PASSWORD = '2';
+  var SUPABASE_CONFIG_KEY = 'avto-capital-supabase-config-v1';
+  var SUPABASE_SESSION_KEY = 'avto-capital-supabase-session-v1';
 
   var navItems = [
     { to: '/', label: 'Главная' },
@@ -22,7 +24,7 @@
     tagline: 'Автомобили под выкуп и заказ',
     heroTitle: 'Автомобили под выкуп и под заказ — спокойно, прозрачно, по делу',
     heroText: 'Подбираем автомобиль под задачу клиента, помогаем разобраться в условиях и сопровождаем оформление без лишней суеты.',
-    heroBadge: 'Премиальный автосервис без аренды и проката',
+    heroBadge: 'Премиальный автомобильный сервис',
     primaryButton: 'Оставить заявку',
     secondaryButton: 'Смотреть каталог',
     phone: '+7 (999) 000-00-00',
@@ -79,6 +81,114 @@
 
   function saveData(data) { safeSet(STORAGE_KEY, JSON.stringify(data)); }
 
+
+  function tryParseJson(raw) {
+    if (!raw) return null;
+    try { return JSON.parse(raw); } catch (e) { return null; }
+  }
+
+  function getSupabaseConfig() {
+    var fileConfig = window.SITE_SUPABASE || {};
+    var localConfig = tryParseJson(safeGet(SUPABASE_CONFIG_KEY)) || {};
+    var url = String(localConfig.url || fileConfig.url || '').trim().replace(/\/$/, '');
+    var key = String(localConfig.key || fileConfig.key || '').trim();
+    var looksBlank = !url || !key || url.indexOf('PROJECT_URL') >= 0 || key.indexOf('PUBLIC') >= 0 || key.indexOf('ANON') >= 0;
+    return { url: url, key: key, ready: !looksBlank };
+  }
+
+  function saveSupabaseConfig(cfg) {
+    safeSet(SUPABASE_CONFIG_KEY, JSON.stringify({ url: String(cfg.url || '').trim().replace(/\/$/, ''), key: String(cfg.key || '').trim() }));
+  }
+
+  function getSession() { return tryParseJson(safeGet(SUPABASE_SESSION_KEY)); }
+  function saveSession(session) { safeSet(SUPABASE_SESSION_KEY, JSON.stringify(session || {})); }
+  function clearSession() { safeRemove(SUPABASE_SESSION_KEY); safeRemove(AUTH_KEY); }
+
+  function mergeRemoteData(content) {
+    var merged = clone(defaultData);
+    if (content && typeof content === 'object') {
+      Object.keys(content).forEach(function (key) { merged[key] = content[key]; });
+    }
+    return merged;
+  }
+
+  function supabaseHeaders(auth, extra) {
+    var cfg = getSupabaseConfig();
+    var session = getSession();
+    var token = auth && session && session.access_token ? session.access_token : cfg.key;
+    var headers = Object.assign({ apikey: cfg.key, Authorization: 'Bearer ' + token }, extra || {});
+    return headers;
+  }
+
+  function supabaseRequest(method, path, body, auth, extraHeaders) {
+    var cfg = getSupabaseConfig();
+    if (!cfg.ready) return Promise.reject(new Error('Supabase не подключён'));
+    var headers = supabaseHeaders(auth, Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {}));
+    var options = { method: method, headers: headers };
+    if (body !== undefined && body !== null) options.body = JSON.stringify(body);
+    return fetch(cfg.url + path, options).then(function (res) {
+      if (!res.ok) {
+        return res.text().then(function (text) { throw new Error(text || ('Supabase error ' + res.status)); });
+      }
+      if (res.status === 204) return null;
+      return res.text().then(function (text) { return text ? JSON.parse(text) : null; });
+    });
+  }
+
+  function loadRemoteData() {
+    if (!getSupabaseConfig().ready) return Promise.resolve(null);
+    return supabaseRequest('GET', '/rest/v1/settings?site_key=eq.main&select=content', null, false)
+      .then(function (rows) {
+        if (rows && rows[0] && rows[0].content) return mergeRemoteData(rows[0].content);
+        return null;
+      });
+  }
+
+  function saveRemoteData(data) {
+    if (!getSupabaseConfig().ready || !(getSession() && getSession().access_token)) return Promise.resolve(false);
+    return supabaseRequest('POST', '/rest/v1/settings?on_conflict=site_key', { site_key: 'main', content: data }, true, { Prefer: 'resolution=merge-duplicates,return=minimal' })
+      .then(function () { return true; });
+  }
+
+  function signInSupabase(email, password) {
+    var cfg = getSupabaseConfig();
+    if (!cfg.ready) return Promise.reject(new Error('Supabase не подключён'));
+    return fetch(cfg.url + '/auth/v1/token?grant_type=password', {
+      method: 'POST',
+      headers: { apikey: cfg.key, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: password })
+    }).then(function (res) {
+      if (!res.ok) return res.text().then(function (text) { throw new Error(text || 'Ошибка входа'); });
+      return res.json();
+    }).then(function (session) {
+      saveSession(session);
+      safeSet(AUTH_KEY, 'yes');
+      return session;
+    });
+  }
+
+  function submitRequestToSupabase(payload) {
+    if (!getSupabaseConfig().ready) return Promise.resolve(false);
+    return supabaseRequest('POST', '/rest/v1/requests', payload, false, { Prefer: 'return=minimal' }).then(function () { return true; });
+  }
+
+  function uploadMediaToSupabase(file) {
+    var cfg = getSupabaseConfig();
+    var session = getSession();
+    if (!cfg.ready || !session || !session.access_token) return Promise.resolve(null);
+    var safeName = String(file.name || 'image').replace(/[^a-zA-Z0-9._-]/g, '-');
+    var path = 'items/' + Date.now() + '-' + Math.random().toString(36).slice(2, 8) + '-' + safeName;
+    var encoded = path.split('/').map(encodeURIComponent).join('/');
+    return fetch(cfg.url + '/storage/v1/object/media/' + encoded, {
+      method: 'POST',
+      headers: { apikey: cfg.key, Authorization: 'Bearer ' + session.access_token, 'Content-Type': file.type || 'application/octet-stream' },
+      body: file
+    }).then(function (res) {
+      if (!res.ok) return res.text().then(function (text) { throw new Error(text || 'Не удалось загрузить фото'); });
+      return cfg.url + '/storage/v1/object/public/media/' + encoded;
+    });
+  }
+
   function Header(props) {
     var data = props.data;
     var route = props.route;
@@ -110,7 +220,7 @@
         ),
         h('div', null, h('span', null, 'Телефон'), h('a', { href: phoneHref(data.phone) }, data.phone)),
         h('div', null, h('span', null, 'Адрес'), h('p', null, data.city, ', ', data.address)),
-        h('div', null, h('span', null, 'Управление'), h('button', { className: 'footer-admin', onClick: function () { go('/admin'); } }, 'Войти в админку'))
+        h('div', null, h('span', null, 'График'), h('p', null, data.worktime || ''), h('button', { className: 'footer-admin', onClick: function () { go('/admin'); } }, 'Панель управления'))
       )
     );
   }
@@ -158,8 +268,8 @@
           ),
           h('div', { className: 'hero-stats' },
             h('div', null, h('strong', null, (data.cars || []).length), h('span', null, 'авто в каталоге')),
-            h('div', null, h('strong', null, '100%'), h('span', null, 'управляется из админки')),
-            h('div', null, h('strong', null, '24/7'), h('span', null, 'сайт онлайн'))
+            h('div', null, h('strong', null, '3'), h('span', null, 'ключевых направления')),
+            h('div', null, h('strong', null, '1'), h('span', null, 'понятный маршрут сделки'))
           )
         ),
         h('div', { className: 'hero-card' },
@@ -186,7 +296,7 @@
     var benefits = props.items || [];
     return h('section', { className: 'section' },
       h('div', { className: 'container' },
-        h(SectionHead, { eyebrow: 'Подход', title: 'Почему это выглядит дороже обычного лендинга', text: 'Каждый блок можно заменить через админку: заголовки, карточки, контакты и автомобили.' }),
+        h(SectionHead, { eyebrow: 'Подход', title: 'Спокойный подбор без лишней суеты', text: 'Аккуратно собираем пожелания, показываем подходящие варианты и помогаем разобраться в деталях.' }),
         h('div', { className: 'benefit-grid' }, benefits.map(function (item, index) {
           return h('article', { className: 'benefit-card', key: item.id || index },
             h('span', null, '0' + (index + 1)),
@@ -239,7 +349,7 @@
     return h('section', { className: 'section catalog-preview' },
       h('div', { className: 'container' },
         h('div', { className: 'split-head' },
-          h(SectionHead, { eyebrow: 'Каталог', title: 'Автомобили в аккуратных карточках', text: 'Фото, статус, характеристики и цена редактируются из админки.' }),
+          h(SectionHead, { eyebrow: 'Каталог', title: 'Автомобили в аккуратных карточках', text: 'Краткие характеристики, статус, цена и понятная заявка по каждому автомобилю.' }),
           h('button', { className: 'btn ghost', onClick: function () { go('/catalog'); } }, 'Весь каталог')
         ),
         h('div', { className: 'catalog-grid' }, cars.map(function (car) { return h(CarCard, { key: car.id, car: car }); }))
@@ -272,15 +382,15 @@
   function Catalog(props) {
     var cars = props.data.cars || [];
     return h('main', null,
-      h(PageHero, { eyebrow: 'Каталог', title: 'Каталог автомобилей', text: 'Наличие, фото, цена и характеристики меняются через админку.' }),
+      h(PageHero, { eyebrow: 'Каталог', title: 'Каталог автомобилей', text: 'Подборка автомобилей с характеристиками, статусом и условиями.' }),
       h('section', { className: 'section' }, h('div', { className: 'container catalog-grid' }, cars.map(function (car) { return h(CarCard, { key: car.id, car: car }); }))),
-      cars.length === 0 && h(EmptyPublic, { title: 'Каталог пока пустой', text: 'Автомобили можно добавить в админке.' })
+      cars.length === 0 && h(EmptyPublic, { title: 'Каталог пока пустой', text: 'Автомобили появятся здесь позже.' })
     );
   }
 
   function Buyout(props) {
     return h('main', null,
-      h(PageHero, { eyebrow: 'Выкуп', title: 'Выкуп автомобиля', text: 'Раздел под услугу выкупа. Тексты и блоки можно заменить в админке.' }),
+      h(PageHero, { eyebrow: 'Выкуп', title: 'Выкуп автомобиля', text: 'Раздел для направления выкупа: понятные условия, оценка и аккуратное оформление.' }),
       h('section', { className: 'section' }, h('div', { className: 'container service-grid' },
         h('article', null, h('h3', null, 'Проверяем задачу'), h('p', null, 'Уточняем бюджет, требования и документы.' )),
         h('article', null, h('h3', null, 'Подбираем вариант'), h('p', null, 'Показываем подходящие автомобили и условия.' )),
@@ -308,7 +418,7 @@
     var data = props.data;
     return h('main', null,
       h(PageHero, { eyebrow: 'О компании', title: data.aboutTitle || 'О компании', text: data.aboutText || '' }),
-      h(EmptyPublic, { title: 'Раздел подготовлен', text: 'Контент можно добавить позже через админку.' })
+      h(EmptyPublic, { title: 'Раздел подготовлен', text: 'Информация появится здесь позже.' })
     );
   }
 
@@ -317,7 +427,7 @@
     var reviews = data.reviews || [];
     return h('main', null,
       h(PageHero, { eyebrow: 'Отзывы', title: data.reviewsTitle || 'Отзывы', text: data.reviewsIntro || '' }),
-      reviews.length === 0 ? h(EmptyPublic, { title: 'Отзывы пока пустые', text: 'Когда появятся отзывы, их можно добавить через админку.' }) :
+      reviews.length === 0 ? h(EmptyPublic, { title: 'Отзывы пока пустые', text: 'Отзывы появятся здесь позже.' }) :
         h('section', { className: 'section' }, h('div', { className: 'container review-grid' }, reviews.map(function (review) {
           return h('article', { className: 'review-card', key: review.id }, h('p', null, '“', review.text, '”'), h('strong', null, review.name), h('span', null, review.role));
         })))
@@ -327,7 +437,7 @@
   function Contacts(props) {
     var data = props.data;
     return h('main', null,
-      h(PageHero, { eyebrow: 'Контакты', title: 'Связаться с компанией', text: 'Номер, адрес, мессенджеры и график меняются в админке.' }),
+      h(PageHero, { eyebrow: 'Контакты', title: 'Связаться с компанией', text: 'Контакты, адрес и удобные способы связи.' }),
       h('section', { className: 'section' }, h('div', { className: 'container contacts-grid' },
         h('article', null, h('span', null, 'Телефон'), h('a', { href: phoneHref(data.phone) }, data.phone)),
         h('article', null, h('span', null, 'WhatsApp'), h('p', null, data.whatsapp)),
@@ -339,13 +449,28 @@
     );
   }
 
-  function RequestPage() {
+  function RequestPage(props) {
+    function onSubmit(e) {
+      e.preventDefault();
+      var form = e.currentTarget;
+      var payload = {
+        name: form.elements.name.value || '',
+        phone: form.elements.phone.value || '',
+        message: form.elements.message.value || ''
+      };
+      var done = function () { alert('Спасибо! Заявка принята.'); form.reset(); };
+      if (props && props.onSubmitRequest) {
+        props.onSubmitRequest(payload).then(done).catch(function () { done(); });
+      } else {
+        done();
+      }
+    }
     return h('main', null,
-      h(PageHero, { eyebrow: 'Заявка', title: 'Оставить заявку', text: 'Демо-форма для презентации. Реальную отправку можно подключить позже.' }),
-      h('section', { className: 'section' }, h('div', { className: 'container form-shell' }, h('form', { onSubmit: function (e) { e.preventDefault(); alert('Демо: заявка сохранена визуально. Реальную отправку подключим отдельно.'); } },
-        h('label', null, 'Имя', h('input', { placeholder: 'Как к вам обращаться' })),
-        h('label', null, 'Телефон', h('input', { placeholder: '+7 ___ ___-__-__' })),
-        h('label', null, 'Что нужно', h('textarea', { placeholder: 'Например: интересует автомобиль под заказ' })),
+      h(PageHero, { eyebrow: 'Заявка', title: 'Оставить заявку', text: 'Оставьте контакты — специалист свяжется и уточнит детали.' }),
+      h('section', { className: 'section' }, h('div', { className: 'container form-shell' }, h('form', { onSubmit: onSubmit },
+        h('label', null, 'Имя', h('input', { name: 'name', placeholder: 'Как к вам обращаться' })),
+        h('label', null, 'Телефон', h('input', { name: 'phone', placeholder: '+7 ___ ___-__-__' })),
+        h('label', null, 'Что нужно', h('textarea', { name: 'message', placeholder: 'Например: интересует автомобиль под заказ' })),
         h('button', { className: 'btn primary', type: 'submit' }, 'Отправить')
       )))
     );
@@ -377,15 +502,20 @@
   }
 
   function AdminLogin(props) {
+    var isRemote = getSupabaseConfig().ready;
     return h('main', { className: 'admin-login-page' },
       h('div', { className: 'admin-login-card' },
         h('span', { className: 'brand-mark big' }, 'A'),
         h('h1', null, 'Вход в админку'),
-        h('p', null, 'Демо-доступ: логин 1, пароль 2'),
         h('form', { onSubmit: function (e) {
           e.preventDefault();
-          var login = e.currentTarget.elements.login.value;
+          var login = String(e.currentTarget.elements.login.value || '').trim();
           var password = e.currentTarget.elements.password.value;
+          if (isRemote) {
+            var authLogin = login.indexOf('@') >= 0 ? login : ((login === '1' || login.toLowerCase() === 'admin') ? 'admin@example.com' : login);
+            signInSupabase(authLogin, password).then(function () { props.onLogin(); }).catch(function () { alert('Неверный логин или пароль'); });
+            return;
+          }
           if (login === ADMIN_LOGIN && password === ADMIN_PASSWORD) {
             safeSet(AUTH_KEY, 'yes');
             props.onLogin();
@@ -393,8 +523,8 @@
             alert('Неверный логин или пароль');
           }
         } },
-          h('label', null, 'Логин', h('input', { name: 'login', autoComplete: 'username', placeholder: '1' })),
-          h('label', null, 'Пароль', h('input', { name: 'password', type: 'password', autoComplete: 'current-password', placeholder: '2' })),
+          h('label', null, isRemote ? 'Логин или email' : 'Логин', h('input', { name: 'login', autoComplete: 'username' })),
+          h('label', null, 'Пароль', h('input', { name: 'password', type: 'password', autoComplete: 'current-password' })),
           h('button', { className: 'btn primary', type: 'submit' }, 'Войти')
         ),
         h('button', { className: 'btn ghost wide', onClick: function () { go('/'); } }, 'Вернуться на сайт')
@@ -408,7 +538,7 @@
     var state = props.state || {};
     var active = state.active || 'main';
 
-    function update(next) { setData(next); saveData(next); }
+    function update(next) { setData(next); saveData(next); if (props.onRemoteSave) props.onRemoteSave(next); }
     function patch(key, value) { var next = clone(data); next[key] = value; update(next); }
     function addCar() {
       var next = clone(data);
@@ -466,7 +596,7 @@
       URL.revokeObjectURL(url);
     }
     function reset() {
-      if (!confirm('Сбросить все демо-изменения?')) return;
+      if (!confirm('Сбросить изменения?')) return;
       update(clone(defaultData));
     }
 
@@ -476,16 +606,17 @@
 
     var content = null;
     if (active === 'main') content = h(AdminMainTab, { data: data, patch: patch });
-    if (active === 'cars') content = h(AdminCarsTab, { data: data, addCar: addCar, updateArrayItem: updateArrayItem, removeItem: removeItem });
+    if (active === 'cars') content = h(AdminCarsTab, { data: data, addCar: addCar, updateArrayItem: updateArrayItem, removeItem: removeItem, uploadMedia: uploadMediaToSupabase });
     if (active === 'contacts') content = h(AdminContactsTab, { data: data, patch: patch });
     if (active === 'about') content = h(AdminAboutTab, { data: data, patch: patch });
     if (active === 'reviews') content = h(AdminReviewsTab, { data: data, addGeneric: addGeneric, updateArrayItem: updateArrayItem, removeItem: removeItem });
     if (active === 'blocks') content = h(AdminBlocksTab, { data: data, addGeneric: addGeneric, updateArrayItem: updateArrayItem, removeItem: removeItem });
+    if (active === 'sync') content = h(AdminSyncTab, { data: data, status: props.remoteStatus, onRemoteSave: props.onRemoteSave, onRemoteLoad: props.onRemoteLoad });
     if (active === 'data') content = h(AdminDataTab, { exportJson: exportJson, importJson: importJson, reset: reset });
 
     return h('main', { className: 'admin-layout' },
       h('aside', { className: 'admin-sidebar' },
-        h('div', { className: 'admin-logo' }, h('span', { className: 'brand-mark' }, 'A'), h('div', null, h('strong', null, 'Админка'), h('em', null, 'логин 1 / пароль 2'))),
+        h('div', { className: 'admin-logo' }, h('span', { className: 'brand-mark' }, 'A'), h('div', null, h('strong', null, 'Панель управления'), h('em', null, 'Контент сайта'))) ,
         h('div', { className: 'admin-tabs' }, tabs.map(function (tab) {
           return h('button', { key: tab[0], className: active === tab[0] ? 'active' : '', onClick: function () { props.setAdminState({ active: tab[0] }); } }, tab[1]);
         })),
@@ -493,7 +624,6 @@
         h('button', { className: 'btn soft wide', onClick: props.onLogout }, 'Выйти')
       ),
       h('section', { className: 'admin-content' },
-        h('div', { className: 'admin-notice' }, h('b', null, 'Демо-режим.'), ' Изменения сохраняются в браузере. Для настоящей общей админки нужен бесплатный backend: Supabase/Firebase.'),
         content
       )
     );
@@ -542,15 +672,26 @@
 
   function ImageField(props) {
     var car = props.car;
-    function onFile(e) {
-      var file = e.target.files && e.target.files[0];
-      if (!file) return;
-      if (file.size > 1024 * 1024 * 2.2) {
-        alert('Для демо лучше загрузить фото до 2 МБ, иначе браузер может не сохранить изменения.');
-      }
+    function localFile(file) {
       var reader = new FileReader();
       reader.onload = function () { props.onChange(reader.result); };
       reader.readAsDataURL(file);
+    }
+    function onFile(e) {
+      var file = e.target.files && e.target.files[0];
+      if (!file) return;
+      if (file.size > 1024 * 1024 * 3) alert('Фото большое — лучше сжать перед загрузкой.');
+      if (props.uploadMedia && getSupabaseConfig().ready && getSession()) {
+        props.uploadMedia(file).then(function (url) {
+          if (url) props.onChange(url);
+          else localFile(file);
+        }).catch(function () {
+          alert('Фото не загрузилось в базу. Сохраню локально для предпросмотра.');
+          localFile(file);
+        });
+        return;
+      }
+      localFile(file);
     }
     return h('div', { className: 'image-admin' },
       h('span', null, 'Фото машины'),
@@ -635,14 +776,36 @@
     );
   }
 
+  function AdminSyncTab(props) {
+    var cfg = getSupabaseConfig();
+    return h('div', null,
+      h('h1', null, 'Подключение базы'),
+      h('p', { className: 'admin-muted' }, cfg.ready ? 'База подключена. Изменения из админки сохраняются в Supabase после входа.' : 'База пока не подключена. Сайт работает локально.'),
+      props.status && h('p', { className: 'admin-status' }, props.status),
+      h('form', { className: 'admin-grid', onSubmit: function (e) {
+        e.preventDefault();
+        saveSupabaseConfig({ url: e.currentTarget.elements.url.value, key: e.currentTarget.elements.key.value });
+        alert('Подключение сохранено в этом браузере. Для публичного сайта эти же значения нужно прописать в assets/supabase-config.js.');
+      } },
+        h('label', null, h('span', null, 'Project URL'), h('input', { name: 'url', defaultValue: cfg.url })),
+        h('label', null, h('span', null, 'Public key / anon key'), h('input', { name: 'key', defaultValue: cfg.key })),
+        h('div', { className: 'span-2 data-actions' },
+          h('button', { className: 'btn primary', type: 'submit' }, 'Сохранить подключение'),
+          h('button', { className: 'btn soft', type: 'button', onClick: function () { props.onRemoteLoad && props.onRemoteLoad(); } }, 'Загрузить из базы'),
+          h('button', { className: 'btn ghost', type: 'button', onClick: function () { props.onRemoteSave && props.onRemoteSave(props.data); } }, 'Сохранить в базу')
+        )
+      )
+    );
+  }
+
   function AdminDataTab(props) {
     return h('div', null,
       h('h1', null, 'Данные сайта'),
-      h('p', { className: 'admin-muted' }, 'В демо-версии можно выгрузить текущие настройки в JSON и загрузить их обратно на другом устройстве.'),
+      h('p', { className: 'admin-muted' }, 'Экспорт и импорт текущих данных сайта.'),
       h('div', { className: 'data-actions' },
         h('button', { className: 'btn primary', onClick: props.exportJson }, 'Скачать JSON'),
         h('label', { className: 'btn soft file-btn' }, 'Загрузить JSON', h('input', { type: 'file', accept: 'application/json', onChange: props.importJson })),
-        h('button', { className: 'btn ghost danger', onClick: props.reset }, 'Сбросить демо')
+        h('button', { className: 'btn ghost danger', onClick: props.reset }, 'Сбросить изменения')
       )
     );
   }
@@ -651,21 +814,44 @@
 
   function App() {
     React.Component.call(this);
-    this.state = { route: getRoute(), data: loadData(), authed: safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' } };
+    this.state = { route: getRoute(), data: loadData(), authed: safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
     this.onHash = this.onHash.bind(this);
     this.setData = this.setData.bind(this);
     this.setAdminState = this.setAdminState.bind(this);
+    this.loadRemoteNow = this.loadRemoteNow.bind(this);
+    this.saveRemoteNow = this.saveRemoteNow.bind(this);
   }
   App.prototype = Object.create(React.Component.prototype);
   App.prototype.constructor = App;
   App.prototype.componentDidMount = function () {
     window.addEventListener('hashchange', this.onHash);
     if (!window.location.hash) window.location.hash = '/';
+    this.loadRemoteNow();
   };
   App.prototype.componentWillUnmount = function () { window.removeEventListener('hashchange', this.onHash); };
   App.prototype.onHash = function () { this.setState({ route: getRoute() }); };
   App.prototype.setData = function (data) { this.setState({ data: data }); };
   App.prototype.setAdminState = function (patch) { this.setState({ adminState: Object.assign({}, this.state.adminState, patch) }); };
+  App.prototype.loadRemoteNow = function () {
+    var self = this;
+    if (!getSupabaseConfig().ready) return Promise.resolve(false);
+    self.setState({ remoteStatus: 'Загружаю данные из базы...' });
+    return loadRemoteData().then(function (remoteData) {
+      if (remoteData) { saveData(remoteData); self.setState({ data: remoteData, remoteStatus: 'Данные загружены из базы.' }); }
+      else self.setState({ remoteStatus: 'В базе пока нет данных сайта.' });
+      return true;
+    }).catch(function () { self.setState({ remoteStatus: 'Не удалось загрузить данные из базы.' }); return false; });
+  };
+  App.prototype.saveRemoteNow = function (data) {
+    var self = this;
+    if (!getSupabaseConfig().ready) { self.setState({ remoteStatus: 'Supabase не подключён.' }); return Promise.resolve(false); }
+    if (!(getSession() && getSession().access_token)) { self.setState({ remoteStatus: 'Сначала войдите через админку Supabase.' }); return Promise.resolve(false); }
+    self.setState({ remoteStatus: 'Сохраняю в базу...' });
+    return saveRemoteData(data || self.state.data).then(function () {
+      self.setState({ remoteStatus: 'Сохранено в Supabase.' });
+      return true;
+    }).catch(function () { self.setState({ remoteStatus: 'Не удалось сохранить в Supabase.' }); return false; });
+  };
   App.prototype.render = function () {
     var route = this.state.route;
     var data = this.state.data;
@@ -678,9 +864,9 @@
     else if (route === '/about') page = h(About, { data: data });
     else if (route === '/reviews') page = h(Reviews, { data: data });
     else if (route === '/contacts') page = h(Contacts, { data: data });
-    else if (route === '/request') page = h(RequestPage, { data: data });
+    else if (route === '/request') page = h(RequestPage, { data: data, onSubmitRequest: submitRequestToSupabase });
     else if (route === '/admin') {
-      page = this.state.authed ? h(AdminPanel, { data: data, state: this.state.adminState, setAdminState: this.setAdminState, setData: this.setData, onLogout: function () { safeRemove(AUTH_KEY); this.setState({ authed: false }); }.bind(this) }) : h(AdminLogin, { onLogin: function () { this.setState({ authed: true }); }.bind(this) });
+      page = this.state.authed ? h(AdminPanel, { data: data, state: this.state.adminState, setAdminState: this.setAdminState, setData: this.setData, remoteStatus: this.state.remoteStatus, onRemoteLoad: this.loadRemoteNow, onRemoteSave: this.saveRemoteNow, onLogout: function () { clearSession(); this.setState({ authed: false }); }.bind(this) }) : h(AdminLogin, { onLogin: function () { this.setState({ authed: true }); this.loadRemoteNow(); }.bind(this) });
     } else page = h(NotFound);
     return h('div', null, !isAdmin && h(Header, { data: data, route: route }), page, !isAdmin && h(Footer, { data: data }));
   };
