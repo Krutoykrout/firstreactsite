@@ -115,8 +115,10 @@
   function supabaseHeaders(auth, extra) {
     var cfg = getSupabaseConfig();
     var session = getSession();
-    var token = auth && session && session.access_token ? session.access_token : cfg.key;
-    var headers = Object.assign({ apikey: cfg.key, Authorization: 'Bearer ' + token }, extra || {});
+    var headers = Object.assign({ apikey: cfg.key }, extra || {});
+    if (auth && session && session.access_token) {
+      headers.Authorization = 'Bearer ' + session.access_token;
+    }
     return headers;
   }
 
@@ -513,7 +515,7 @@
           var password = e.currentTarget.elements.password.value;
           if (isRemote) {
             var authLogin = login.indexOf('@') >= 0 ? login : ((login === '1' || login.toLowerCase() === 'admin') ? 'admin@example.com' : login);
-            signInSupabase(authLogin, password).then(function () { props.onLogin(); }).catch(function () { alert('Неверный логин или пароль'); });
+            signInSupabase(authLogin, password).then(function () { props.onLogin(); }).catch(function (err) { alert('Не вошли в Supabase. Проверь email/пароль и что пользователь создан. Ошибка: ' + (err && err.message ? err.message.slice(0, 120) : '')); });
             return;
           }
           if (login === ADMIN_LOGIN && password === ADMIN_PASSWORD) {
@@ -624,6 +626,13 @@
         h('button', { className: 'btn soft wide', onClick: props.onLogout }, 'Выйти')
       ),
       h('section', { className: 'admin-content' },
+        h('div', { className: 'admin-savebar' },
+          h('div', null,
+            h('strong', null, 'Управление сайтом'),
+            h('span', null, props.remoteStatus || (getSupabaseConfig().ready ? 'Изменения сохраняются в базу после входа.' : 'Сайт работает локально.'))
+          ),
+          h('button', { className: 'btn primary', onClick: function () { props.onRemoteSave && props.onRemoteSave(data); } }, 'Сохранить на сайте')
+        ),
         content
       )
     );
@@ -814,7 +823,9 @@
 
   function App() {
     React.Component.call(this);
-    this.state = { route: getRoute(), data: loadData(), authed: safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
+    var cfgReady = getSupabaseConfig().ready;
+    var hasRemoteSession = !!(getSession() && getSession().access_token);
+    this.state = { route: getRoute(), data: loadData(), authed: cfgReady ? hasRemoteSession : safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
     this.onHash = this.onHash.bind(this);
     this.setData = this.setData.bind(this);
     this.setAdminState = this.setAdminState.bind(this);
@@ -825,6 +836,7 @@
   App.prototype.constructor = App;
   App.prototype.componentDidMount = function () {
     window.addEventListener('hashchange', this.onHash);
+    if (getSupabaseConfig().ready && !(getSession() && getSession().access_token)) safeRemove(AUTH_KEY);
     if (!window.location.hash) window.location.hash = '/';
     this.loadRemoteNow();
   };
@@ -840,7 +852,7 @@
       if (remoteData) { saveData(remoteData); self.setState({ data: remoteData, remoteStatus: 'Данные загружены из базы.' }); }
       else self.setState({ remoteStatus: 'В базе пока нет данных сайта.' });
       return true;
-    }).catch(function () { self.setState({ remoteStatus: 'Не удалось загрузить данные из базы.' }); return false; });
+    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось загрузить данные из базы: ' + (err && err.message ? err.message.slice(0, 120) : 'ошибка') }); return false; });
   };
   App.prototype.saveRemoteNow = function (data) {
     var self = this;
@@ -850,7 +862,7 @@
     return saveRemoteData(data || self.state.data).then(function () {
       self.setState({ remoteStatus: 'Сохранено в Supabase.' });
       return true;
-    }).catch(function () { self.setState({ remoteStatus: 'Не удалось сохранить в Supabase.' }); return false; });
+    }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось сохранить в Supabase: ' + (err && err.message ? err.message.slice(0, 160) : 'ошибка') }); return false; });
   };
   App.prototype.render = function () {
     var route = this.state.route;
