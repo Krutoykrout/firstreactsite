@@ -126,7 +126,7 @@
     var cfg = getSupabaseConfig();
     if (!cfg.ready) return Promise.reject(new Error('Supabase не подключён'));
     var headers = supabaseHeaders(auth, Object.assign({ 'Content-Type': 'application/json' }, extraHeaders || {}));
-    var options = { method: method, headers: headers };
+    var options = { method: method, headers: headers, cache: 'no-store' };
     if (body !== undefined && body !== null) options.body = JSON.stringify(body);
     return fetch(cfg.url + path, options).then(function (res) {
       if (!res.ok) {
@@ -157,6 +157,7 @@
     if (!cfg.ready) return Promise.reject(new Error('Supabase не подключён'));
     return fetch(cfg.url + '/auth/v1/token?grant_type=password', {
       method: 'POST',
+      cache: 'no-store',
       headers: { apikey: cfg.key, 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: email, password: password })
     }).then(function (res) {
@@ -183,6 +184,7 @@
     var encoded = path.split('/').map(encodeURIComponent).join('/');
     return fetch(cfg.url + '/storage/v1/object/media/' + encoded, {
       method: 'POST',
+      cache: 'no-store',
       headers: { apikey: cfg.key, Authorization: 'Bearer ' + session.access_token, 'Content-Type': file.type || 'application/octet-stream' },
       body: file
     }).then(function (res) {
@@ -825,7 +827,7 @@
     React.Component.call(this);
     var cfgReady = getSupabaseConfig().ready;
     var hasRemoteSession = !!(getSession() && getSession().access_token);
-    this.state = { route: getRoute(), data: loadData(), authed: cfgReady ? hasRemoteSession : safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
+    this.state = { route: getRoute(), data: cfgReady ? clone(defaultData) : loadData(), authed: cfgReady ? hasRemoteSession : safeGet(AUTH_KEY) === 'yes', adminState: { active: 'main' }, remoteStatus: '' };
     this.onHash = this.onHash.bind(this);
     this.setData = this.setData.bind(this);
     this.setAdminState = this.setAdminState.bind(this);
@@ -860,7 +862,9 @@
     if (!(getSession() && getSession().access_token)) { self.setState({ remoteStatus: 'Сначала войдите через админку Supabase.' }); return Promise.resolve(false); }
     self.setState({ remoteStatus: 'Сохраняю в базу...' });
     return saveRemoteData(data || self.state.data).then(function () {
-      self.setState({ remoteStatus: 'Сохранено в Supabase.' });
+      var saved = data || self.state.data;
+      saveData(saved);
+      self.setState({ data: saved, remoteStatus: 'Сохранено в Supabase. Обновите страницу на другом устройстве.' });
       return true;
     }).catch(function (err) { self.setState({ remoteStatus: 'Не удалось сохранить в Supabase: ' + (err && err.message ? err.message.slice(0, 160) : 'ошибка') }); return false; });
   };
